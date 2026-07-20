@@ -1,81 +1,133 @@
-# Blender MCP - Blender 2.80 backport (minimal core)
+# Blender MCP - Blender 2.80 backport
 #
-# Backported from Siddharth Ahuja's blender-mcp addon (www.github.com/ahujasid, (c) 2025)
-# to run under Blender 2.80 / Python 3.7.
+# A Blender 2.80 / Python 3.7 compatible add-on that speaks the *official*
+# Blender MCP socket protocol (projects.blender.org/lab/blender_mcp), so the
+# official Blender MCP server (localhost:9876) can drive Blender 2.80.
 #
-# This is a REDUCED port. It keeps the socket server and the core command
-# handlers (get_scene_info, get_object_info, get_viewport_screenshot,
-# execute_code) plus a simple Connect/Disconnect sidebar panel, so an MCP
-# client on localhost:9876 can drive Blender 2.80. The optional asset
-# integrations from the upstream addon (PolyHaven, Hyper3D/Rodin, Sketchfab,
-# Hunyuan3D) are intentionally removed: they rely on Blender 3.x+ APIs and
-# Python 3.10 `match` syntax that do not exist on 2.80. Their status commands
-# are stubbed to "disabled" so the MCP client's startup probes still succeed.
+# The official add-on is a Python package that targets a recent Blender and
+# uses Python 3.10+ typing (`X | None` in signatures, etc.), which will not run
+# under 2.80's Python 3.7. Fortunately its socket server implements exactly ONE
+# request type - `{"type": "execute", "code": ..., "strict_json": bool}` - and
+# every MCP tool (execute_blender_code, get_blendfile_summary, object summaries,
+# screenshots, ...) is just server-side Python sent through that one channel,
+# reading back a `result` dict. So this single-file add-on reimplements just
+# that protocol, using API available in Blender 2.80.
+#
+# Protocol (null-byte-delimited JSON both directions):
+#   request : {"type": "execute", "code": "<python>", "strict_json": <bool>}\0
+#   response: {"status": "ok", "result": <dict>[, "stdout", "stderr"]}\0
+#          or {"status": "error", "message": "<traceback/message>"[, ...]}\0
+# The executed code assigns a JSON-serialisable dict to a variable `result`.
+#
+# NOTE: deferred responses (code that defines `check_is_finished`, used by some
+# long-running tools like renders) are NOT supported here - they return a clear
+# "unsupported" error, matching the official server's background-mode behaviour.
 
 import bpy
-import mathutils
 import json
-import threading
 import socket
+import threading
 import time
 import traceback
-import os
+import sys
 import io
 import queue
 from bpy.props import IntProperty, BoolProperty
-from contextlib import redirect_stdout
 
 bl_info = {
     "name": "Blender MCP (2.80 backport)",
     "author": "BlenderMCP (backport)",
-    "version": (1, 2),
+    "version": (2, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Sidebar > BlenderMCP",
-    "description": "Connect Blender 2.80 to an MCP client (minimal core backport)",
+    "description": "Connect Blender 2.80 to the official Blender MCP server (localhost:9876)",
     "category": "Interface",
 }
 
+# Print each request/response to the system console when True.
+DEBUG = False
+
+DEFAULT_HOST = "localhost"
+DEFAULT_PORT = 9876
+_CLIENT_TIMEOUT = 10.0            # seconds to receive a complete request
+_RECV_BUFFER_SIZE = 4096
+_MAX_REQUEST_BYTES = 10 * 1024 * 1024  # 10 MiB
+_DEFERRED_UNSUPPORTED_MESSAGE = (
+    "Deferred responses via `check_is_finished` are not supported by the "
+    "Blender 2.80 backport add-on. Finish the request synchronously instead."
+)
+
+
+class _Tee(io.TextIOBase):
+    """Write to both a buffer and the original stream (so prints still show in the console)."""
+
+    def __init__(self, original):
+        self._buffer = io.StringIO()
+        self._original = original
+
+    def write(self, s):
+        try:
+            self._original.write(s)
+        except Exception:
+            pass
+        return self._buffer.write(s)
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+        self._buffer.flush()
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+def _blocked_exit(*args, **kwargs):
+    raise RuntimeError("sys.exit() is not allowed in MCP-executed code")
+
 
 class BlenderMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT):
         self.host = host
         self.port = port
         self.running = False
         self.socket = None
         self.server_thread = None
-        # Commands received on worker threads are handed to the main thread
-        # through this queue and drained by the modal operator's TIMER handler
-        # (process_pending). All bpy access stays on the main thread. A modal
-        # operator timer is used instead of bpy.app.timers because on Blender
-        # 2.80 app-timers do not fire while the window is unfocused/idle, while
-        # window (GHOST) timers keep posting TIMER events regardless of focus.
+        # Worker threads read a full request off the socket and hand
+        # (request_bytes, client_socket) to the main thread through this queue.
+        # process_pending() (driven by the modal operator's window TIMER) drains
+        # it, so all bpy access happens on the main thread. A window/GHOST timer
+        # is used rather than bpy.app.timers because the latter does not fire
+        # while Blender is unfocused on 2.80.
         self.command_queue = queue.Queue()
         self.modal_active = False
+
+    # ------------------------------------------------------------------ #
+    #  Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
 
     def start(self):
         if bpy.app.background:
             print("BlenderMCP: cannot start server in background mode (blender -b) - commands would never execute")
             return
-
         if self.running:
             print("Server is already running")
             return
 
         self.running = True
-
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
+            self.socket.listen(5)
 
             self.server_thread = threading.Thread(target=self._server_loop)
             self.server_thread.daemon = True
             self.server_thread.start()
 
-            # NB: the main-thread command drain is driven by the modal operator
-            # (BLENDERMCP_OT_StartServer), which owns a window TIMER. See
-            # process_pending().
+            # The main-thread command drain is driven by the modal operator's
+            # window TIMER (see BLENDERMCP_OT_StartServer / process_pending).
             print("BlenderMCP server started on {}:{}".format(self.host, self.port))
         except Exception as e:
             print("Failed to start server: {}".format(str(e)))
@@ -84,14 +136,12 @@ class BlenderMCPServer:
     def stop(self):
         self.running = False
         # The modal operator watches self.running and tears down its own timer.
-
         if self.socket:
             try:
                 self.socket.close()
             except Exception:
                 pass
             self.socket = None
-
         if self.server_thread:
             try:
                 if self.server_thread.is_alive():
@@ -99,323 +149,199 @@ class BlenderMCPServer:
             except Exception:
                 pass
             self.server_thread = None
-
         print("BlenderMCP server stopped")
 
-    def _server_loop(self):
-        """Main server loop in a separate thread"""
-        print("Server thread started")
-        self.socket.settimeout(1.0)  # Timeout to allow for stopping
+    # ------------------------------------------------------------------ #
+    #  Networking (worker threads)                                        #
+    # ------------------------------------------------------------------ #
 
+    def _server_loop(self):
+        print("Server thread started")
+        self.socket.settimeout(1.0)  # allow periodic checks of self.running
         while self.running:
             try:
                 try:
                     client, address = self.socket.accept()
-                    print("Connected to client: {}".format(address))
-
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client,)
-                    )
-                    client_thread.daemon = True
-                    client_thread.start()
                 except socket.timeout:
                     continue
                 except Exception as e:
-                    print("Error accepting connection: {}".format(str(e)))
+                    if self.running:
+                        print("Error accepting connection: {}".format(str(e)))
                     time.sleep(0.5)
+                    continue
+                if DEBUG:
+                    print("Connected to client: {}".format(address))
+                t = threading.Thread(target=self._handle_client, args=(client,))
+                t.daemon = True
+                t.start()
             except Exception as e:
-                print("Error in server loop: {}".format(str(e)))
                 if not self.running:
                     break
+                print("Error in server loop: {}".format(str(e)))
                 time.sleep(0.5)
-
         print("Server thread stopped")
 
     def _handle_client(self, client):
-        """Handle connected client"""
-        print("Client handler started")
-        client.settimeout(None)  # No timeout
-        buffer = b''
+        """
+        Read a single null-terminated request, then hand it to the main thread.
 
+        The official protocol is one request per connection; the response is
+        sent (and the socket closed) by process_pending on the main thread.
+        """
+        client.settimeout(_CLIENT_TIMEOUT)
+        buffer = bytearray()
         try:
-            while self.running:
-                try:
-                    data = client.recv(8192)
-                    if not data:
-                        print("Client disconnected")
-                        break
-
-                    print("[DBG] recv {} bytes: {}".format(len(data), data[:120]))
-                    buffer += data
-                    try:
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
-
-                        # Hand the command to the main thread for execution.
-                        # The reply is sent from process_pending (main thread).
-                        print("[DBG] parsed+queued command type={}".format(command.get("type")))
-                        self.command_queue.put((command, client))
-                    except json.JSONDecodeError:
-                        print("[DBG] JSONDecodeError; buffered {} bytes so far".format(len(buffer)))
-                        pass
-                except Exception as e:
-                    print("Error receiving data: {}".format(str(e)))
-                    break
+            while self.running and b"\0" not in buffer:
+                chunk = client.recv(_RECV_BUFFER_SIZE)
+                if not chunk:
+                    # Disconnected before a complete request arrived.
+                    self._safe_close(client)
+                    return
+                buffer.extend(chunk)
+                if len(buffer) > _MAX_REQUEST_BYTES:
+                    self._send_and_close(
+                        client,
+                        {"status": "error",
+                         "message": "Request exceeds {} byte limit".format(_MAX_REQUEST_BYTES)},
+                    )
+                    return
+            if not self.running:
+                self._safe_close(client)
+                return
+            request_data = bytes(buffer[:buffer.index(b"\0")])
+            # Execution (and the reply) happen on the main thread.
+            self.command_queue.put((request_data, client))
+        except socket.timeout:
+            self._send_and_close(client, {"status": "error", "message": "Client timed out"})
         except Exception as e:
             print("Error in client handler: {}".format(str(e)))
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
-            print("Client handler stopped")
-
-    def process_pending(self):
-        """
-        Drain and execute all queued commands on Blender's MAIN thread.
-
-        Called from the modal operator's TIMER handler. All bpy access happens
-        here, on the main thread.
-        """
-        while True:
-            try:
-                command, client = self.command_queue.get_nowait()
-            except queue.Empty:
-                break
-            print("[DBG] draining command type={}".format(command.get("type")))
-            try:
-                response = self.execute_command(command)
-                client.sendall(json.dumps(response).encode('utf-8'))
-            except Exception as e:
-                print("Error executing command: {}".format(str(e)))
-                traceback.print_exc()
-                try:
-                    client.sendall(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
-                except Exception:
-                    pass
-
-    def execute_command(self, command):
-        """Execute a command in the main Blender thread"""
-        try:
-            return self._execute_command_internal(command)
-        except Exception as e:
-            print("Error executing command: {}".format(str(e)))
-            traceback.print_exc()
-            return {"status": "error", "message": str(e)}
-
-    def _execute_command_internal(self, command):
-        """Internal command execution"""
-        cmd_type = command.get("type")
-        params = command.get("params", {})
-
-        # Only the always-available core handlers are supported in this backport.
-        # The asset-integration status probes are stubbed to "disabled" so the
-        # MCP client's startup handshake still succeeds.
-        handlers = {
-            "get_scene_info": self.get_scene_info,
-            "get_object_info": self.get_object_info,
-            "get_viewport_screenshot": self.get_viewport_screenshot,
-            "execute_code": self.execute_code,
-            "get_telemetry_consent": self.get_telemetry_consent,
-            "get_polyhaven_status": self.get_polyhaven_status,
-            "get_hyper3d_status": self.get_hyper3d_status,
-            "get_sketchfab_status": self.get_sketchfab_status,
-            "get_hunyuan3d_status": self.get_hunyuan3d_status,
-        }
-
-        handler = handlers.get(cmd_type)
-        if handler:
-            try:
-                print("Executing handler for {}".format(cmd_type))
-                result = handler(**params)
-                print("Handler execution complete")
-                return {"status": "success", "result": result}
-            except Exception as e:
-                print("Error in handler: {}".format(str(e)))
-                traceback.print_exc()
-                return {"status": "error", "message": str(e)}
-        else:
-            return {"status": "error",
-                    "message": "Unknown command type: {} (not supported in the 2.80 backport)".format(cmd_type)}
-
-    # ------------------------------------------------------------------ #
-    #  Core handlers                                                     #
-    # ------------------------------------------------------------------ #
-
-    def get_scene_info(self):
-        """Get information about the current Blender scene"""
-        try:
-            print("Getting scene info...")
-            scene_info = {
-                "name": bpy.context.scene.name,
-                "object_count": len(bpy.context.scene.objects),
-                "objects": [],
-                "materials_count": len(bpy.data.materials),
-            }
-
-            for i, obj in enumerate(bpy.context.scene.objects):
-                if i >= 10:
-                    break
-                obj_info = {
-                    "name": obj.name,
-                    "type": obj.type,
-                    "location": [round(float(obj.location.x), 2),
-                                 round(float(obj.location.y), 2),
-                                 round(float(obj.location.z), 2)],
-                }
-                scene_info["objects"].append(obj_info)
-
-            print("Scene info collected: {} objects".format(len(scene_info['objects'])))
-            return scene_info
-        except Exception as e:
-            print("Error in get_scene_info: {}".format(str(e)))
-            traceback.print_exc()
-            return {"error": str(e)}
+            self._safe_close(client)
 
     @staticmethod
-    def _get_aabb(obj):
-        """Returns the world-space axis-aligned bounding box (AABB) of an object."""
-        if obj.type != 'MESH':
-            raise TypeError("Object must be a mesh")
-
-        local_bbox_corners = [mathutils.Vector(corner) for corner in obj.bound_box]
-        # matrix @ vector works on Blender 2.80's mathutils
-        world_bbox_corners = [obj.matrix_world @ corner for corner in local_bbox_corners]
-
-        min_corner = mathutils.Vector(map(min, zip(*world_bbox_corners)))
-        max_corner = mathutils.Vector(map(max, zip(*world_bbox_corners)))
-
-        return [[c for c in min_corner], [c for c in max_corner]]
-
-    def get_object_info(self, name):
-        """Get detailed information about a specific object"""
-        obj = bpy.data.objects.get(name)
-        if not obj:
-            raise ValueError("Object not found: {}".format(name))
-
-        obj_info = {
-            "name": obj.name,
-            "type": obj.type,
-            "location": [obj.location.x, obj.location.y, obj.location.z],
-            "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
-            "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
-            "visible": obj.visible_get(),
-            "materials": [],
-        }
-
-        if obj.type == "MESH":
-            obj_info["world_bounding_box"] = self._get_aabb(obj)
-
-        for slot in obj.material_slots:
-            if slot.material:
-                obj_info["materials"].append(slot.material.name)
-
-        if obj.type == 'MESH' and obj.data:
-            mesh = obj.data
-            obj_info["mesh"] = {
-                "vertices": len(mesh.vertices),
-                "edges": len(mesh.edges),
-                "polygons": len(mesh.polygons),
-            }
-
-        return obj_info
-
-    def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
-        """
-        Capture a screenshot of the current 3D viewport (Blender 2.80 path).
-
-        2.80 has no `bpy.context.temp_override` and no `screen.screenshot_area`;
-        instead we pass an explicit context-override dict to `screen.screenshot`
-        with `full=False` to capture only the active (VIEW_3D) area.
-        """
+    def _safe_close(client):
         try:
-            if not filepath:
-                return {"error": "No filepath provided"}
+            client.close()
+        except Exception:
+            pass
 
-            window = bpy.context.window
-            screen = bpy.context.screen
-
-            area = None
-            for a in screen.areas:
-                if a.type == 'VIEW_3D':
-                    area = a
-                    break
-            if not area:
-                return {"error": "No 3D viewport found"}
-
-            region = None
-            for r in area.regions:
-                if r.type == 'WINDOW':
-                    region = r
-                    break
-
-            override = {"window": window, "screen": screen, "area": area}
-            if region is not None:
-                override["region"] = region
-
-            # full=False -> capture only the active area (the overridden VIEW_3D)
-            bpy.ops.screen.screenshot(override, filepath=filepath, full=False)
-
-            img = bpy.data.images.load(filepath)
-            width, height = img.size
-
-            if max(width, height) > max_size:
-                scale = max_size / float(max(width, height))
-                new_width = int(width * scale)
-                new_height = int(height * scale)
-                img.scale(new_width, new_height)
-                img.file_format = format.upper()
-                img.save()
-                width, height = new_width, new_height
-
-            bpy.data.images.remove(img)
-
-            return {
-                "success": True,
-                "width": width,
-                "height": height,
-                "filepath": filepath,
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-    def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
+    def _send_and_close(self, client, response):
         try:
-            namespace = {"bpy": bpy}
-            capture_buffer = io.StringIO()
-            with redirect_stdout(capture_buffer):
+            client.sendall(json.dumps(response).encode("utf-8") + b"\0")
+        except Exception:
+            pass
+        self._safe_close(client)
+
+    # ------------------------------------------------------------------ #
+    #  Execution (main thread, via modal TIMER)                           #
+    # ------------------------------------------------------------------ #
+
+    def process_pending(self):
+        """Drain the queue and execute each request on Blender's MAIN thread."""
+        while True:
+            try:
+                request_data, client = self.command_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                response = self._execute_request(request_data)
+            except Exception:
+                response = {"status": "error", "message": traceback.format_exc()}
+            self._send_and_close(client, response)
+
+    def _execute_request(self, data):
+        try:
+            request = json.loads(data)
+        except Exception:
+            return {"status": "error", "message": "Invalid JSON request"}
+
+        if request.get("type") != "execute":
+            return {"status": "error",
+                    "message": "Unknown request type: {!r}".format(request.get("type"))}
+
+        code = request.get("code", "")
+        strict_json = request.get("strict_json")
+        if not isinstance(strict_json, bool):
+            return {"status": "error",
+                    "message": ("Internal error: request is missing the required 'strict_json' "
+                                "boolean key.")}
+
+        if DEBUG:
+            print("request:\n{}".format(code), file=sys.stderr)
+        response = self._execute_code(code, strict_json)
+        if DEBUG:
+            print("response: {}".format(json.dumps(response)[:500]), file=sys.stderr)
+        return response
+
+    def _execute_code(self, code, strict_json):
+        namespace = {"result": {}}
+
+        old_out, old_err, old_exit = sys.stdout, sys.stderr, sys.exit
+        tee_out, tee_err = _Tee(old_out), _Tee(old_err)
+        sys.stdout, sys.stderr = tee_out, tee_err
+        sys.exit = _blocked_exit
+        exec_error = None
+        try:
+            try:
                 exec(code, namespace)
-            captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
-        except Exception as e:
-            raise Exception("Code execution error: {}".format(str(e)))
+            except Exception:
+                exec_error = traceback.format_exc()
+        finally:
+            sys.stdout, sys.stderr, sys.exit = old_out, old_err, old_exit
 
-    # ------------------------------------------------------------------ #
-    #  Stubbed status probes (features not ported)                       #
-    # ------------------------------------------------------------------ #
+        if exec_error is not None:
+            response = {"status": "error", "message": exec_error}
+            return self._attach_output(response, tee_out, tee_err)
 
-    def get_telemetry_consent(self):
-        # No telemetry in the backport.
-        return {"consent": False}
+        # Deferred responses (background jobs) are not supported here.
+        check_fn = namespace.get("check_is_finished")
+        if callable(check_fn):
+            response = {"status": "error", "message": _DEFERRED_UNSUPPORTED_MESSAGE}
+            return self._attach_output(response, tee_out, tee_err)
 
-    def get_polyhaven_status(self):
-        return {"enabled": False, "message": "PolyHaven integration is not available in the Blender 2.80 backport."}
+        result = namespace.get("result")
+        if not isinstance(result, dict):
+            response = {
+                "status": "error",
+                "message": ("The `result` variable must be a dict, not {}. "
+                            "Wrap your return value: result = {{\"key\": value}}"
+                            ).format(type(result).__name__),
+            }
+            return self._attach_output(response, tee_out, tee_err)
 
-    def get_hyper3d_status(self):
-        return {"enabled": False, "message": "Hyper3D integration is not available in the Blender 2.80 backport."}
+        if strict_json:
+            try:
+                json.dumps(result)
+            except (TypeError, ValueError) as ex:
+                response = {"status": "error",
+                            "message": "The `result` value is not JSON-serializable: {}".format(str(ex))}
+            else:
+                response = {"status": "ok", "result": result}
+        else:
+            # repr fallback so non-serializable objects (e.g. Blender IDs) survive.
+            result = json.loads(json.dumps(result, default=repr))
+            response = {"status": "ok", "result": result}
+        return self._attach_output(response, tee_out, tee_err)
 
-    def get_sketchfab_status(self):
-        return {"enabled": False, "message": "Sketchfab integration is not available in the Blender 2.80 backport."}
+    @staticmethod
+    def _attach_output(response, tee_out, tee_err):
+        so = tee_out.getvalue()
+        se = tee_err.getvalue()
+        if so:
+            response["stdout"] = so
+        if se:
+            response["stderr"] = se
+        return response
 
-    def get_hunyuan3d_status(self):
-        return {"enabled": False, "message": "Hunyuan3D integration is not available in the Blender 2.80 backport."}
+
+# Module-level handle to the running server instance. (Blender 2.80's bpy.types
+# is a read-only RNA wrapper and rejects arbitrary attribute assignment, so the
+# server cannot be stored there the way the upstream addons do.)
+blendermcp_server = None
 
 
-# ---------------------------------------------------------------------- #
-#  UI                                                                     #
-# ---------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+#  UI                                                                          #
+# ---------------------------------------------------------------------------- #
 
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
     bl_label = "Blender MCP"
@@ -427,9 +353,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
         layout.prop(scene, "blendermcp_port")
-
         if not scene.blendermcp_server_running:
             layout.operator("blendermcp.start_server", text="Connect to MCP server")
         else:
@@ -440,27 +364,21 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
 class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_idname = "blendermcp.start_server"
     bl_label = "Connect to MCP server"
-    bl_description = "Start the BlenderMCP server to connect with an MCP client"
+    bl_description = "Start the BlenderMCP server to connect with the Blender MCP client"
 
     _timer = None
     _server = None
-    _tick = 0
 
     def execute(self, context):
-        # Allow calling from scripts / search menu (no event needed).
         return self.invoke(context, None)
 
     def invoke(self, context, event):
         global blendermcp_server
         scene = context.scene
 
-        # NOTE: Blender 2.80's `bpy.types` (an RNA wrapper) rejects arbitrary
-        # attribute assignment, so we keep the running server in a module-level
-        # global rather than on bpy.types (upstream stores it on bpy.types).
         if blendermcp_server is None:
             blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
 
-        # Guard against starting a second modal handler (would double-drain).
         if blendermcp_server.running and blendermcp_server.modal_active:
             self.report({'INFO'}, "BlenderMCP server already running")
             return {'CANCELLED'}
@@ -482,20 +400,12 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        # Bound to the specific server instance this modal started with, so a
-        # disconnect+reconnect can't leave two modals draining one queue.
         srv = self._server
         if srv is None or not srv.running or srv is not blendermcp_server:
             self.cancel(context)
             return {'CANCELLED'}
-
         if event.type == 'TIMER':
-            self._tick += 1
-            if self._tick % 40 == 0:  # ~ every 2s at 0.05s interval
-                print("[DBG] modal alive, tick {}".format(self._tick))
             srv.process_pending()
-
-        # Pass everything through so normal Blender interaction is unaffected.
         return {'PASS_THROUGH'}
 
     def cancel(self, context):
@@ -520,18 +430,11 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
     def execute(self, context):
         global blendermcp_server
         scene = context.scene
-
         if blendermcp_server is not None:
             blendermcp_server.stop()
             blendermcp_server = None
-
         scene.blendermcp_server_running = False
-
         return {'FINISHED'}
-
-
-# Module-level handle to the running server instance (see StartServer note).
-blendermcp_server = None
 
 
 classes = (
@@ -545,32 +448,28 @@ def register():
     bpy.types.Scene.blendermcp_port = IntProperty(
         name="Port",
         description="Port for the BlenderMCP server",
-        default=9876,
+        default=DEFAULT_PORT,
         min=1024,
-        max=65535
+        max=65535,
     )
     bpy.types.Scene.blendermcp_server_running = BoolProperty(
         name="Server Running",
-        default=False
+        default=False,
     )
-
     for cls in classes:
         bpy.utils.register_class(cls)
 
 
 def unregister():
     global blendermcp_server
-    # Make sure the server is stopped before unregistering
     if blendermcp_server is not None:
         try:
             blendermcp_server.stop()
         except Exception:
             pass
         blendermcp_server = None
-
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-
     del bpy.types.Scene.blendermcp_port
     del bpy.types.Scene.blendermcp_server_running
 
