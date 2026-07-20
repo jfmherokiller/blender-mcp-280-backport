@@ -21,6 +21,7 @@ import time
 import traceback
 import os
 import io
+import queue
 from bpy.props import IntProperty, BoolProperty
 from contextlib import redirect_stdout
 
@@ -42,6 +43,12 @@ class BlenderMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        # Commands received on worker threads are handed to the main thread
+        # through this queue and drained by _process_queue (a persistent timer
+        # registered on the main thread). This avoids calling
+        # bpy.app.timers.register from a worker thread - unreliable on 2.80 -
+        # and keeps all bpy access on the main thread.
+        self.command_queue = queue.Queue()
 
     def start(self):
         if bpy.app.background:
@@ -64,6 +71,13 @@ class BlenderMCPServer:
             self.server_thread.daemon = True
             self.server_thread.start()
 
+            # Register the main-thread command processor ONCE, from the main
+            # thread (start() is called from the operator's execute()). This
+            # persistent, self-rescheduling timer also keeps Blender's event
+            # loop ticking so queued commands are serviced even when idle.
+            if not bpy.app.timers.is_registered(self._process_queue):
+                bpy.app.timers.register(self._process_queue, first_interval=0.0, persistent=True)
+
             print("BlenderMCP server started on {}:{}".format(self.host, self.port))
         except Exception as e:
             print("Failed to start server: {}".format(str(e)))
@@ -71,6 +85,14 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
+
+        # Proactively drop the main-thread processor timer (it would also
+        # unregister itself on its next tick via the `return None` above).
+        try:
+            if bpy.app.timers.is_registered(self._process_queue):
+                bpy.app.timers.unregister(self._process_queue)
+        except Exception:
+            pass
 
         if self.socket:
             try:
@@ -138,30 +160,9 @@ class BlenderMCPServer:
                         command = json.loads(buffer.decode('utf-8'))
                         buffer = b''
 
-                        # Execute command in Blender's main thread
-                        def execute_wrapper():
-                            try:
-                                response = self.execute_command(command)
-                                response_json = json.dumps(response)
-                                try:
-                                    client.sendall(response_json.encode('utf-8'))
-                                except Exception:
-                                    print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print("Error executing command: {}".format(str(e)))
-                                traceback.print_exc()
-                                try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except Exception:
-                                    pass
-                            return None
-
-                        # Schedule execution in main thread (bpy.app.timers exists in 2.80)
-                        bpy.app.timers.register(execute_wrapper, first_interval=0.0)
+                        # Hand the command to the main thread for execution.
+                        # The reply is sent from _process_queue (main thread).
+                        self.command_queue.put((command, client))
                     except json.JSONDecodeError:
                         # Incomplete data, wait for more
                         pass
@@ -176,6 +177,35 @@ class BlenderMCPServer:
             except Exception:
                 pass
             print("Client handler stopped")
+
+    def _process_queue(self):
+        """
+        Drain and execute queued commands on Blender's MAIN thread.
+
+        Registered once (persistent) from start(). Returns a float so it keeps
+        re-scheduling itself; this also keeps the event loop awake so replies
+        go out promptly even when the UI is idle. Returning None unregisters it.
+        """
+        if not self.running:
+            return None  # unregister the timer
+
+        while True:
+            try:
+                command, client = self.command_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                response = self.execute_command(command)
+                client.sendall(json.dumps(response).encode('utf-8'))
+            except Exception as e:
+                print("Error executing command: {}".format(str(e)))
+                traceback.print_exc()
+                try:
+                    client.sendall(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                except Exception:
+                    pass
+
+        return 0.05  # poll again shortly
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
