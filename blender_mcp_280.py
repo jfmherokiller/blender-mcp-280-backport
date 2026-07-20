@@ -44,11 +44,13 @@ class BlenderMCPServer:
         self.socket = None
         self.server_thread = None
         # Commands received on worker threads are handed to the main thread
-        # through this queue and drained by _process_queue (a persistent timer
-        # registered on the main thread). This avoids calling
-        # bpy.app.timers.register from a worker thread - unreliable on 2.80 -
-        # and keeps all bpy access on the main thread.
+        # through this queue and drained by the modal operator's TIMER handler
+        # (process_pending). All bpy access stays on the main thread. A modal
+        # operator timer is used instead of bpy.app.timers because on Blender
+        # 2.80 app-timers do not fire while the window is unfocused/idle, while
+        # window (GHOST) timers keep posting TIMER events regardless of focus.
         self.command_queue = queue.Queue()
+        self.modal_active = False
 
     def start(self):
         if bpy.app.background:
@@ -71,13 +73,9 @@ class BlenderMCPServer:
             self.server_thread.daemon = True
             self.server_thread.start()
 
-            # Register the main-thread command processor ONCE, from the main
-            # thread (start() is called from the operator's execute()). This
-            # persistent, self-rescheduling timer also keeps Blender's event
-            # loop ticking so queued commands are serviced even when idle.
-            if not bpy.app.timers.is_registered(self._process_queue):
-                bpy.app.timers.register(self._process_queue, first_interval=0.0, persistent=True)
-
+            # NB: the main-thread command drain is driven by the modal operator
+            # (BLENDERMCP_OT_StartServer), which owns a window TIMER. See
+            # process_pending().
             print("BlenderMCP server started on {}:{}".format(self.host, self.port))
         except Exception as e:
             print("Failed to start server: {}".format(str(e)))
@@ -85,14 +83,7 @@ class BlenderMCPServer:
 
     def stop(self):
         self.running = False
-
-        # Proactively drop the main-thread processor timer (it would also
-        # unregister itself on its next tick via the `return None` above).
-        try:
-            if bpy.app.timers.is_registered(self._process_queue):
-                bpy.app.timers.unregister(self._process_queue)
-        except Exception:
-            pass
+        # The modal operator watches self.running and tears down its own timer.
 
         if self.socket:
             try:
@@ -178,17 +169,13 @@ class BlenderMCPServer:
                 pass
             print("Client handler stopped")
 
-    def _process_queue(self):
+    def process_pending(self):
         """
-        Drain and execute queued commands on Blender's MAIN thread.
+        Drain and execute all queued commands on Blender's MAIN thread.
 
-        Registered once (persistent) from start(). Returns a float so it keeps
-        re-scheduling itself; this also keeps the event loop awake so replies
-        go out promptly even when the UI is idle. Returning None unregisters it.
+        Called from the modal operator's TIMER handler. All bpy access happens
+        here, on the main thread.
         """
-        if not self.running:
-            return None  # unregister the timer
-
         while True:
             try:
                 command, client = self.command_queue.get_nowait()
@@ -204,8 +191,6 @@ class BlenderMCPServer:
                     client.sendall(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
                 except Exception:
                     pass
-
-        return 0.05  # poll again shortly
 
     def execute_command(self, command):
         """Execute a command in the main Blender thread"""
@@ -454,7 +439,14 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_label = "Connect to MCP server"
     bl_description = "Start the BlenderMCP server to connect with an MCP client"
 
+    _timer = None
+    _server = None
+
     def execute(self, context):
+        # Allow calling from scripts / search menu (no event needed).
+        return self.invoke(context, None)
+
+    def invoke(self, context, event):
         global blendermcp_server
         scene = context.scene
 
@@ -464,10 +456,53 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
         if blendermcp_server is None:
             blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
 
+        # Guard against starting a second modal handler (would double-drain).
+        if blendermcp_server.running and blendermcp_server.modal_active:
+            self.report({'INFO'}, "BlenderMCP server already running")
+            return {'CANCELLED'}
+
         blendermcp_server.start()
         scene.blendermcp_server_running = blendermcp_server.running
+        if not blendermcp_server.running:
+            return {'CANCELLED'}
 
-        return {'FINISHED'}
+        # Drive the main-thread command drain from a window TIMER. Unlike
+        # bpy.app.timers, window timers keep firing when Blender is unfocused
+        # on 2.80, so MCP calls are serviced even while you work elsewhere.
+        wm = context.window_manager
+        self._server = blendermcp_server
+        self._timer = wm.event_timer_add(0.05, window=context.window)
+        wm.modal_handler_add(self)
+        blendermcp_server.modal_active = True
+        print("BlenderMCP modal command-processor started")
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        # Bound to the specific server instance this modal started with, so a
+        # disconnect+reconnect can't leave two modals draining one queue.
+        srv = self._server
+        if srv is None or not srv.running or srv is not blendermcp_server:
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            srv.process_pending()
+
+        # Pass everything through so normal Blender interaction is unaffected.
+        return {'PASS_THROUGH'}
+
+    def cancel(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            try:
+                wm.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+        if self._server is not None:
+            self._server.modal_active = False
+        self._server = None
+        print("BlenderMCP modal command-processor stopped")
 
 
 class BLENDERMCP_OT_StopServer(bpy.types.Operator):
