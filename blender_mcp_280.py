@@ -146,16 +146,18 @@ class BlenderMCPServer:
                         print("Client disconnected")
                         break
 
+                    print("[DBG] recv {} bytes: {}".format(len(data), data[:120]))
                     buffer += data
                     try:
                         command = json.loads(buffer.decode('utf-8'))
                         buffer = b''
 
                         # Hand the command to the main thread for execution.
-                        # The reply is sent from _process_queue (main thread).
+                        # The reply is sent from process_pending (main thread).
+                        print("[DBG] parsed+queued command type={}".format(command.get("type")))
                         self.command_queue.put((command, client))
                     except json.JSONDecodeError:
-                        # Incomplete data, wait for more
+                        print("[DBG] JSONDecodeError; buffered {} bytes so far".format(len(buffer)))
                         pass
                 except Exception as e:
                     print("Error receiving data: {}".format(str(e)))
@@ -181,6 +183,7 @@ class BlenderMCPServer:
                 command, client = self.command_queue.get_nowait()
             except queue.Empty:
                 break
+            print("[DBG] draining command type={}".format(command.get("type")))
             try:
                 response = self.execute_command(command)
                 client.sendall(json.dumps(response).encode('utf-8'))
@@ -441,6 +444,7 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
 
     _timer = None
     _server = None
+    _tick = 0
 
     def execute(self, context):
         # Allow calling from scripts / search menu (no event needed).
@@ -486,6 +490,9 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
+            self._tick += 1
+            if self._tick % 40 == 0:  # ~ every 2s at 0.05s interval
+                print("[DBG] modal alive, tick {}".format(self._tick))
             srv.process_pending()
 
         # Pass everything through so normal Blender interaction is unaffected.
