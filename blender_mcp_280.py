@@ -425,13 +425,17 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_description = "Start the BlenderMCP server to connect with an MCP client"
 
     def execute(self, context):
+        global blendermcp_server
         scene = context.scene
 
-        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
+        # NOTE: Blender 2.80's `bpy.types` (an RNA wrapper) rejects arbitrary
+        # attribute assignment, so we keep the running server in a module-level
+        # global rather than on bpy.types (upstream stores it on bpy.types).
+        if blendermcp_server is None:
+            blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
 
-        bpy.types.blendermcp_server.start()
-        scene.blendermcp_server_running = bpy.types.blendermcp_server.running
+        blendermcp_server.start()
+        scene.blendermcp_server_running = blendermcp_server.running
 
         return {'FINISHED'}
 
@@ -442,15 +446,20 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
     bl_description = "Stop the BlenderMCP server"
 
     def execute(self, context):
+        global blendermcp_server
         scene = context.scene
 
-        if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server.stop()
-            del bpy.types.blendermcp_server
+        if blendermcp_server is not None:
+            blendermcp_server.stop()
+            blendermcp_server = None
 
         scene.blendermcp_server_running = False
 
         return {'FINISHED'}
+
+
+# Module-level handle to the running server instance (see StartServer note).
+blendermcp_server = None
 
 
 classes = (
@@ -478,13 +487,14 @@ def register():
 
 
 def unregister():
+    global blendermcp_server
     # Make sure the server is stopped before unregistering
-    if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
+    if blendermcp_server is not None:
         try:
-            bpy.types.blendermcp_server.stop()
+            blendermcp_server.stop()
         except Exception:
             pass
-        del bpy.types.blendermcp_server
+        blendermcp_server = None
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
